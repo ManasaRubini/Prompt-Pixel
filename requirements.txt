@@ -1,0 +1,347 @@
+flask
+python-dotenv
+diffusers>=0.18.0
+transformers
+torch          # install the correct wheel for your CUDA version, or cpu-only build
+accelerate
+safetensors
+Pillow
+urllib3
+
+
+
+
+# app.py
+import os
+import io
+import uuid
+from datetime import datetime
+from pathlib import Path
+from flask import Flask, render_template, request, jsonify, send_from_directory, url_for
+from dotenv import load_dotenv
+
+
+# Load env
+load_dotenv()
+
+
+HF_TOKEN = os.getenv("HF_TOKEN")  # optional; required for some private models
+MODEL_ID = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
+
+
+# create directories
+BASE_DIR = Path(__file__).resolve().parent
+GENERATED_DIR = BASE_DIR / "static" / "generated"
+GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+
+
+app = Flask(__name__, static_folder="static", template_folder="templates")
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB (safety)
+
+
+# Try to load diffusers pipeline. If fails, app will still start but generation disabled.
+USE_DIFFUSERS = False
+pipeline = None
+try:
+    import torch
+    from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[INFO] Torch device: {device}")
+
+
+    # Load model (may take time & GPU memory)
+    print("[INFO] Loading Stable Diffusion pipeline... this may take a while.")
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        use_auth_token=HF_TOKEN if HF_TOKEN else None,
+        torch_dtype=torch.float16 if device == "cuda" else None,
+    )
+
+
+    # optional: improve performance with the scheduler or enable attention slicing
+    try:
+        pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
+    except Exception:
+        pass
+    pipeline.safety_checker = None  # you MAY want to re-enable safety or implement your own filter
+    pipeline.enable_attention_slicing()
+    pipeline = pipeline.to(device)
+    USE_DIFFUSERS = True
+    print("[INFO] Pipeline loaded.")
+except Exception as e:
+    print("[WARN] Could not initialize local diffusers pipeline:", e)
+    USE_DIFFUSERS = False
+    pipeline = None
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    """
+    Expects JSON:
+    {
+      "prompt": "a cat on a skateboard",
+      "steps": 20,
+      "width": 512,
+      "height": 512,
+      "guidance_scale": 7.5,
+      "negative_prompt": ""
+    }
+    Returns JSON:
+    { "status":"ok", "image_url":"/static/generated/....png", "filename": "....png" }
+    """
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"status": "error", "detail": "Invalid JSON"}), 400
+
+
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"status": "error", "detail": "Prompt required"}), 400
+
+
+    # parameters with defaults and bounds
+    try:
+        steps = int(data.get("steps", 20))
+        steps = max(1, min(steps, 150))
+    except Exception:
+        steps = 20
+    try:
+        width = int(data.get("width", 512))
+        height = int(data.get("height", 512))
+        # clamp commonly supported sizes (multiples of 64 recommended)
+        width = max(256, min(width, 1024))
+        height = max(256, min(height, 1024))
+    except Exception:
+        width, height = 512, 512
+
+
+    try:
+        guidance_scale = float(data.get("guidance_scale", 7.5))
+    except Exception:
+        guidance_scale = 7.5
+
+
+    negative_prompt = data.get("negative_prompt", None)
+
+
+    if not USE_DIFFUSERS or pipeline is None:
+        return jsonify({
+            "status": "error",
+            "detail": "Generation backend not available. Install diffusers & torch or set up a remote generation API."
+        }), 500
+
+
+    # generate
+    try:
+        # generator for reproducibility (optional)
+        gen = None
+        import torch
+        if torch.cuda.is_available():
+            gen = torch.Generator(device="cuda").manual_seed(torch.randint(0, 2**30, (1,)).item())
+
+
+        # call pipeline
+        result = pipeline(prompt=prompt,
+                          negative_prompt=negative_prompt,
+                          height=height,
+                          width=width,
+                          num_inference_steps=steps,
+                          guidance_scale=guidance_scale,
+                          generator=gen)
+        image = result.images[0]
+
+
+        # create filename and save
+        filename = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
+        save_path = GENERATED_DIR / filename
+        image.save(save_path)
+
+
+        image_url = url_for("static", filename=f"generated/{filename}")
+        return jsonify({"status": "ok", "image_url": image_url, "filename": filename})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": f"Generation failed: {e}"}), 500
+
+
+# optional: endpoint to list generated images (for admin/gallery)
+@app.route("/gallery")
+def gallery():
+    files = sorted(GENERATED_DIR.glob("*.png"), reverse=True)
+    urls = [url_for("static", filename=f"generated/{p.name}") for p in files]
+    return jsonify({"images": urls})
+
+
+if __name__ == "__main__":
+    # Note: in production use gunicorn/uvicorn + proper host config
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)), debug=True)
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Prompt Pixel — Text to Image</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+</head>
+<body>
+  <div class="wrap">
+    <h1>Prompt Pixel</h1>
+    <p class="sub">Enter a prompt and click Generate (Stable Diffusion v1.5)</p>
+
+
+    <textarea id="prompt" placeholder='e.g. "A serene lake at sunrise with misty mountains"'>A fantasy landscape, ultra-detailed, cinematic lighting</textarea>
+
+
+    <div class="controls">
+      <label>Width <input id="width" type="number" value="512" min="256" max="1024"></label>
+      <label>Height <input id="height" type="number" value="512" min="256" max="1024"></label>
+      <label>Steps <input id="steps" type="number" value="20" min="1" max="150"></label>
+      <label>Guidance <input id="guidance" type="number" value="7.5" step="0.1" min="1" max="20"></label>
+    </div>
+
+
+    <div style="margin-top:10px;">
+      <button id="generateBtn">Generate</button>
+      <span id="status" class="status"></span>
+    </div>
+
+
+    <div id="result" class="result">
+      <img id="resultImage" alt="Generated image will appear here" />
+      <div id="downloadArea" style="margin-top:8px;"></div>
+    </div>
+
+
+    <hr />
+    <p class="note">Model weights & GPU required for good performance. If backend can't load model, generation will fail.</p>
+  </div>
+
+
+  <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>
+
+// main.js
+const generateBtn = document.getElementById("generateBtn");
+const statusSpan = document.getElementById("status");
+const resultImg = document.getElementById("resultImage");
+const downloadArea = document.getElementById("downloadArea");
+
+
+generateBtn.addEventListener("click", async () => {
+  statusSpan.textContent = "Generating...";
+  generateBtn.disabled = true;
+  resultImg.src = "";
+  downloadArea.innerHTML = "";
+
+
+  const prompt = document.getElementById("prompt").value;
+  const width = parseInt(document.getElementById("width").value) || 512;
+  const height = parseInt(document.getElementById("height").value) || 512;
+  const steps = parseInt(document.getElementById("steps").value) || 20;
+  const guidance = parseFloat(document.getElementById("guidance").value) || 7.5;
+
+
+  try {
+    const res = await fetch("/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt,
+        width,
+        height,
+        steps,
+        guidance_scale: guidance
+      })
+    });
+
+
+    const data = await res.json();
+    if (!res.ok || data.status !== "ok") {
+      const detail = (data && data.detail) ? data.detail : JSON.stringify(data);
+      statusSpan.textContent = "Error: " + detail;
+    } else {
+      statusSpan.textContent = "Done";
+      // pipeline saved file to /static/generated/<filename>
+      resultImg.src = data.image_url + "?t=" + Date.now(); // cache bust
+      downloadArea.innerHTML = `<a href="${data.image_url}" download="${data.filename}">Download image</a>`;
+    }
+  } catch (err) {
+    statusSpan.textContent = "Error: " + err.message;
+  } finally {
+    generateBtn.disabled = false;
+  }
+});
+
+/* style.css */
+:root {
+  --bg: #0b1220;
+  --card: #071022;
+  --text: #e6eef8;
+  --muted: #9fb0d8;
+  --accent: #2563eb;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  background: linear-gradient(180deg,#030412 0%, #071022 100%);
+  color:var(--text);
+  display:flex;
+  align-items:flex-start;
+  justify-content:center;
+  padding:36px;
+  min-height:100vh;
+}
+.wrap{
+  width:920px;
+  max-width:95%;
+  background:rgba(255,255,255,0.02);
+  border-radius:12px;
+  padding:20px 22px;
+  box-shadow: 0 8px 30px rgba(2,6,23,0.6);
+}
+h1{margin:0;font-size:20px}
+.sub{margin:6px 0;color:var(--muted);font-size:14px}
+textarea{
+  width:100%;
+  min-height:120px;
+  border-radius:8px;
+  background:#061124;
+  border:1px solid rgba(255,255,255,0.04);
+  color:var(--text);
+  padding:12px;
+  resize:vertical;
+  font-size:15px;
+}
+.controls{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap}
+.controls label{
+  display:flex;gap:6px;align-items:center;color:var(--muted);
+  font-size:13px;
+  background:rgba(255,255,255,0.02);
+  padding:6px 8px;border-radius:8px;
+}
+.controls input[type="number"]{width:80px;background:transparent;border:none;color:var(--text);outline:none}
+button{
+  background:var(--accent);
+  border:none;color:white;padding:8px 12px;border-radius:10px;font-weight:600;cursor:pointer
+}
+.status{margin-left:12px;color:var(--muted)}
+.result{margin-top:14px;display:flex;flex-direction:column;align-items:center;gap:8px;min-height:200px}
+.result img{max-width:100%;border-radius:10px;box-shadow:0 6px 18px rgba(2,6,23,0.5)}
+.note{color:var(--muted);font-size:13px}
+
+# Optional: Hugging Face token if using private or gated models
+HF_TOKEN=your_huggingface_token_here
+
+
+# Optional: override model id (default runwayml/stable-diffusion-v1-5)
+MODEL_ID=runwayml/stable-diffusion-v1-5
+i want to make a documentation on this
